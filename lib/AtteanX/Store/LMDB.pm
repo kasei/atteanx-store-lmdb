@@ -4,7 +4,7 @@ AtteanX::Store::LMDB - LMDB-based RDF store
 
 =head1 VERSION
 
-This document describes AtteanX::Store::LMDB version 0.026
+This document describes AtteanX::Store::LMDB version 0.001
 
 =head1 SYNOPSIS
 
@@ -19,37 +19,18 @@ AtteanX::Store::LMDB provides a persistent quad-store based on LMDB.
 use v5.14;
 use warnings;
 
-package AtteanX::Store::LMDB 0.026 {
+package AtteanX::Store::LMDB 0.001 {
 use Moo;
 use Type::Tiny::Role;
-use Types::Standard qw(Str Int ArrayRef HashRef ConsumerOf InstanceOf);
+use Types::Standard qw(Str InstanceOf);
 use LMDB_File qw(:flags :cursor_op);
-use Encode;
-use Set::Scalar;
 use Digest::SHA qw(sha256 sha256_hex);
-use List::Util qw(first);
 use Scalar::Util qw(refaddr reftype blessed);
 use Math::Cartesian::Product;
 use Devel::Peek;
 use namespace::clean;
 
 with 'Attean::API::QuadStore';
-
-my @pos_names	= Attean::API::Quad->variables;
-
-=head1 ATTRIBUTES
-
-=over 4
-
-=item C<< subject >>
-
-=item C<< predicate >>
-
-=item C<< object >>
-
-=item C<< graph >>
-
-=back
 
 =head1 METHODS
 
@@ -60,7 +41,7 @@ L<Attean::API::QuadStore> class.
 
 =item C<< new () >>
 
-Returns a new memory-backed storage object.
+Returns a new LMDB-backed store object.
 
 =cut
 
@@ -96,7 +77,7 @@ sub size {
 =item C<< get_quads ( $subject, $predicate, $object, $graph ) >>
 
 Returns a stream object of all statements matching the specified subject,
-predicate and objects. Any of the arguments may be undef to match any value.
+predicate, object, and graph. Any of the arguments may be undef to match any value.
 
 =cut
 
