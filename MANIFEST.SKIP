@@ -1,0 +1,15 @@
+.sparql-test-suite-*
+cover_db
+.git
+.DS_Store
+.proverc
+cover.sh
+Makefile
+MANIFEST.SKIP
+MYMETA.json
+MYMETA.yml
+xt/data
+xt/parser-turtle.t
+xt/dawg11
+xt/dawg-eval11.t
+
