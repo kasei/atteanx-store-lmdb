@@ -158,7 +158,6 @@ sub _encode_term {
 		} else {
 			return 'S"' . $value;
 		}
-		die 'XXX' . Dumper($term);
 	} elsif ($term->isa('Attean::Blank')) {
 		return 'B"' . $value;
 	}
@@ -232,21 +231,13 @@ sub _get_or_create_term_id {
 	return $id_value;
 }
 
-sub _get_all_unordered_quads {
+sub _materialize_quads {
 	my $self	= shift;
-	my $quads	= shift;
-	my ($key, $value);
-	my @quadids;
-	$self->iterate_database($quads, sub {
-		my ($key, $value)	= @_;
-		my (@ids)	= unpack('Q>4', $value);
-		push(@quadids, \@ids);
-	});
-	
+	my $quadids	= shift;
 	my $sub	= sub {
 		my $txn		= $self->env->BeginTxn(MDB_RDONLY);
 		my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
-		QUAD: while (my $tids = shift(@quadids)) {
+		QUAD: while (my $tids = shift(@$quadids)) {
 			my @terms;
 			foreach my $tid (@$tids) {
 				my $key	= pack('Q>', $tid);
@@ -263,6 +254,19 @@ sub _get_all_unordered_quads {
 		return;
 	};
 	return Attean::CodeIterator->new( generator => $sub, item_type => 'Attean::API::Quad' );
+}
+
+sub _get_all_unordered_quads {
+	my $self	= shift;
+	my $quads	= shift;
+	my ($key, $value);
+	my @quadids;
+	$self->iterate_database($quads, sub {
+		my ($key, $value)	= @_;
+		my (@ids)	= unpack('Q>4', $value);
+		push(@quadids, \@ids);
+	});
+	return \@quadids;
 }
 
 sub _get_unordered_matching_quads {
@@ -282,27 +286,7 @@ sub _get_unordered_matching_quads {
 		}
 		push(@quadids, \@ids);
 	});
-	
-	my $sub	= sub {
-		my $txn		= $self->env->BeginTxn(MDB_RDONLY);
-		my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
-		QUAD: while (my $tids = shift(@quadids)) {
-			my @terms;
-			foreach my $tid (@$tids) {
-				my $key	= pack('Q>', $tid);
-				my $termdata = $i2t->get($key);
-				next QUAD unless ($termdata);
-				my $term	= $self->_parse_term($termdata);
-				next QUAD unless ($term);
-				push(@terms, $term);
-			}
-			if (scalar(@terms) == 4) {
-				return Attean::Quad->new(@terms);
-			}
-		}
-		return;
-	};
-	return Attean::CodeIterator->new( generator => $sub, item_type => 'Attean::API::Quad' );
+	return \@quadids;
 }
 
 sub _get_ordered_matching_quads {
@@ -333,73 +317,60 @@ sub _get_ordered_matching_quads {
 		}
 		push(@quadids, \@ids);
 	});
-	
-	my $sub	= sub {
-		my $txn		= $self->env->BeginTxn(MDB_RDONLY);
-		my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
-		QUAD: while (my $tids = shift(@quadids)) {
-			my @terms;
-			foreach my $tid (@$tids) {
-				my $key	= pack('Q>', $tid);
-				my $termdata = $i2t->get($key);
-				next QUAD unless ($termdata);
-				my $term	= $self->_parse_term($termdata);
-				next QUAD unless ($term);
-				push(@terms, $term);
-			}
-			if (scalar(@terms) == 4) {
-				return Attean::Quad->new(@terms);
-			}
+	return \@quadids;
+}
+
+sub _compute_bound {
+	my $self	= shift;
+	my @nodes	= @_;
+	my $bound	= 0;
+	my %bound;
+	my $txn		= $self->env->BeginTxn(MDB_RDONLY);
+	my $t2i		= $txn->OpenDB({ dbname => 'term_to_id', });
+	foreach my $pos (0 .. 3) {
+		my $n	= $nodes[ $pos ];
+		if (blessed($n) and $n->does('Attean::API::Variable')) {
+			$n	= undef;
+			$nodes[$pos]	= undef;
 		}
-		return;
-	};
-	return Attean::CodeIterator->new( generator => $sub, item_type => 'Attean::API::Quad' );
+		if (blessed($n)) {
+			$bound++;
+			my $id			= $self->_get_term_id($n, $t2i);
+			unless ($id) {
+# 					warn "No such term in quadstore: " . $n->as_string;
+				return Attean::ListIterator->new( values => [], item_type => 'Attean::API::Quad' );
+			}
+			$bound{ $pos }	= $id;
+		}
+	}
+	return %bound;
 }
 
 sub _get_quads {
 	my $self	= shift;
 	my @nodes	= @_;
-	my $bound	= 0;
-	my %bound;
-	
-	{
-		my $txn		= $self->env->BeginTxn(MDB_RDONLY);
-		my $t2i		= $txn->OpenDB({ dbname => 'term_to_id', });
-		foreach my $pos (0 .. 3) {
-			my $n	= $nodes[ $pos ];
-			if (blessed($n) and $n->does('Attean::API::Variable')) {
-				$n	= undef;
-				$nodes[$pos]	= undef;
-			}
-			if (blessed($n)) {
-				$bound++;
-				my $id			= $self->_get_term_id($n, $t2i);
-				unless ($id) {
-# 					warn "No such term in quadstore: " . $n->as_string;
-					return Attean::ListIterator->new( values => [], item_type => 'Attean::API::Quad' );
-				}
-				$bound{ $pos }	= $id;
-			}
-		}
-	}
+	my %bound	= $self->_compute_bound(@nodes);
+	my $bound	= scalar(@{[keys %bound]});
 	
 	my $txn		= $self->env->BeginTxn(MDB_RDONLY);
 	my $quads	= $txn->OpenDB({ dbname => 'quads', });
 	if ($bound == 0) {
-		return $self->_get_all_unordered_quads($quads);
+		my $quadids	= $self->_get_all_unordered_quads($quads);
+		return $self->_materialize_quads($quadids);
 	} else {
 		if (my $best = $self->_best_index(\%bound, $txn)) {
 			my ($index, $score)	= @$best;
 			my $order		= $self->indexes->{$index};
-			warn "best index: $index";
 			my @positions	= @$order[0..$score-1];
 			my @prefix		= map { $bound{$_} } @positions;
 			my @lower		= @prefix;
 			my @upper		= @prefix;
 			$upper[-1]++;
-			return $self->_get_ordered_matching_quads($txn, \%bound, $index, \@lower, \@upper);
+			my $quadids	= $self->_get_ordered_matching_quads($txn, \%bound, $index, \@lower, \@upper);
+			return $self->_materialize_quads($quadids);
 		}
-		return $self->_get_unordered_matching_quads($quads, \%bound);
+		my $quadids	= $self->_get_unordered_matching_quads($quads, \%bound);
+		return $self->_materialize_quads($quadids);
 	}
 }
 
@@ -421,7 +392,6 @@ sub _best_index {
 	}
      
 	@scores	= sort { $b->[1] <=> $a->[1] } @scores;
-	warn Dumper(\@scores);
 	return shift(@scores);
 }
 
@@ -611,12 +581,8 @@ Removes all quads with the given C<< $graph >>.
 	sub clear_graph {
 		my $self	= shift;
 		my $graph	= shift;
-		my $txn		= $self->env->BeginTxn(MDB_RDONLY);
-		my $t2i		= $txn->OpenDB({ dbname => 'term_to_id', });
-
-		my $gid		= $self->_get_term_id($graph, $t2i);
-		return unless defined($gid);
-		
+		my %bound	= $self->_compute_bound(undef, undef, undef, $graph);
+		my $bound	= scalar(@{[keys %bound]});
 		die 'unimplemented';
 	}
 
