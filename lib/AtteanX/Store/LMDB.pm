@@ -22,15 +22,17 @@ use warnings;
 package AtteanX::Store::LMDB 0.001 {
 use Moo;
 use Type::Tiny::Role;
-use Types::Standard qw(Str InstanceOf);
+use Types::Standard qw(Str InstanceOf HashRef);
 use LMDB_File qw(:flags :cursor_op);
 use Digest::SHA qw(sha256 sha256_hex);
 use Scalar::Util qw(refaddr reftype blessed);
 use Math::Cartesian::Product;
+use List::Util qw(any all first);
 use Devel::Peek;
 use namespace::clean;
 
 with 'Attean::API::QuadStore';
+with 'Attean::API::MutableQuadStore';
 
 =head1 METHODS
 
@@ -47,6 +49,7 @@ Returns a new LMDB-backed store object.
 
 has filename => (is => 'ro', isa => Str, required => 1);
 has env		=> (is => 'rw', isa => InstanceOf['LMDB::Env']);
+has indexes	=> (is => 'rw', isa => HashRef, default => sub { +{} });
 
 sub BUILD {
 	my $self	= shift;
@@ -58,6 +61,54 @@ sub BUILD {
 		mode   => 0640,
 	});
 	$self->env($env);
+	
+	my $txn		= $self->env->BeginTxn(MDB_RDONLY);
+	my $indexes	= $txn->OpenDB({ dbname => 'fullIndexes' });
+	$self->iterate_database($indexes, sub {
+		my ($key, $value)	= @_;
+		my @order	= unpack('Q>4', $value);
+		$self->indexes->{$key}	= \@order;
+	});
+}
+
+sub iterate_database {
+	my $self	= shift;
+	my $db		= shift;
+	my $handler	= shift;
+	my $cursor	= $db->Cursor;
+	eval {
+		local($LMDB_File::die_on_err)	= 0;
+		my ($key, $value);
+		unless ($cursor->get($key, $value, MDB_FIRST)) {
+			while (1) {
+				$handler->($key, $value);
+				last if $cursor->get($key, $value, MDB_NEXT);
+			}
+		}
+	};
+}
+
+sub iterate_database_range {
+	my $self	= shift;
+	my $db		= shift;
+	my $from	= shift;
+	my $to		= shift;
+	my $handler	= shift;
+	my $cursor	= $db->Cursor;
+	eval {
+		local($LMDB_File::die_on_err)	= 0;
+		my $key	= $from;
+		my $value;
+		unless ($cursor->get($key, $value, MDB_SET_RANGE)) {
+			while (1) {
+				use bytes;
+				my $c = $key cmp $to;
+				last if ($c >= 0);
+				$handler->($key, $value);
+				last if $cursor->get($key, $value, MDB_NEXT);
+			}
+		}
+	};
 }
 
 =item C<< size >>
@@ -97,14 +148,22 @@ sub _encode_term {
 		return 'I"' . $value;
 	} elsif ($term->isa('Attean::Literal')) {
 		if (my $dt = $term->datatype) {
+			if ($dt->value eq 'http://www.w3.org/2001/XMLSchema#string') {
+				return 'S"' . $value;
+			} else {
+				return 'D' . $dt->value . '"' . $value;
+			}
 		} elsif (my $lang = $term->language) {
+				return 'L' . $lang . '"' . $value;
 		} else {
+			return 'S"' . $value;
 		}
-		die Dumper($term);
+		die 'XXX' . Dumper($term);
 	} elsif ($term->isa('Attean::Blank')) {
 		return 'B"' . $value;
 	}
 }
+
 sub _parse_term {
 	my $self	= shift;
 	my $data	= shift;
@@ -147,6 +206,156 @@ sub _get_term_id {
 	return $id;
 }
 
+sub _get_or_create_term_id {
+	my $self	= shift;
+	my $term	= shift;
+	my $txn		= shift;
+	my $stats	= shift;
+	my $t2i		= shift;
+	my $i2t		= shift;
+	my $id		= $self->_get_term_id($term, $t2i);
+	if ($id) {
+		return $id;
+	}
+	
+	my $next_key	= 'next_unassigned_term_id';
+	my ($next)		= unpack('Q>', $stats->get($next_key));
+# 	warn "next term id: $next\n";
+	my $encoded		= $self->_encode_term($term);
+	my $hash		= sha256($encoded);
+	my $id_value	= $next++;
+	$id				= pack('Q>', $id_value);
+	
+	$t2i->put($hash, $id);
+	$i2t->put($id, $encoded);
+	$stats->put($next_key, pack('Q>', $next));
+	return $id_value;
+}
+
+sub _get_all_unordered_quads {
+	my $self	= shift;
+	my $quads	= shift;
+	my ($key, $value);
+	my @quadids;
+	$self->iterate_database($quads, sub {
+		my ($key, $value)	= @_;
+		my (@ids)	= unpack('Q>4', $value);
+		push(@quadids, \@ids);
+	});
+	
+	my $sub	= sub {
+		my $txn		= $self->env->BeginTxn(MDB_RDONLY);
+		my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
+		QUAD: while (my $tids = shift(@quadids)) {
+			my @terms;
+			foreach my $tid (@$tids) {
+				my $key	= pack('Q>', $tid);
+				my $termdata = $i2t->get($key);
+				next QUAD unless ($termdata);
+				my $term	= $self->_parse_term($termdata);
+				next QUAD unless ($term);
+				push(@terms, $term);
+			}
+			if (scalar(@terms) == 4) {
+				return Attean::Quad->new(@terms);
+			}
+		}
+		return;
+	};
+	return Attean::CodeIterator->new( generator => $sub, item_type => 'Attean::API::Quad' );
+}
+
+sub _get_unordered_matching_quads {
+	my $self	= shift;
+	my $quads	= shift;
+	my $bound	= shift;
+	my ($key, $value);
+	my @quadids;
+	$self->iterate_database($quads, sub {
+		my ($key, $value)	= @_;
+		my (@ids)	= unpack('Q>4', $value);
+		foreach my $k (keys %$bound) {
+			my $id	= $bound->{$k};
+			unless ($id == $ids[$k]) {
+				return;
+			}
+		}
+		push(@quadids, \@ids);
+	});
+	
+	my $sub	= sub {
+		my $txn		= $self->env->BeginTxn(MDB_RDONLY);
+		my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
+		QUAD: while (my $tids = shift(@quadids)) {
+			my @terms;
+			foreach my $tid (@$tids) {
+				my $key	= pack('Q>', $tid);
+				my $termdata = $i2t->get($key);
+				next QUAD unless ($termdata);
+				my $term	= $self->_parse_term($termdata);
+				next QUAD unless ($term);
+				push(@terms, $term);
+			}
+			if (scalar(@terms) == 4) {
+				return Attean::Quad->new(@terms);
+			}
+		}
+		return;
+	};
+	return Attean::CodeIterator->new( generator => $sub, item_type => 'Attean::API::Quad' );
+}
+
+sub _get_ordered_matching_quads {
+	my $self	= shift;
+	my $txn		= shift;
+	my $bound	= shift;
+	my $name	= shift;
+	my $lower	= shift;
+	my $upper	= shift;
+	my $from	= pack('Q>4', @$lower, 0, 0, 0, 0);
+	my $to		= pack('Q>4', @$upper, 0, 0, 0, 0);
+	my $index	= $txn->OpenDB({ dbname => $name });
+	my $order	= $self->indexes->{$name};
+	my @quadids;
+# 	warn "range query on index $name\n";
+	$self->iterate_database_range($index, $from, $to, sub {
+		my ($key, $value)	= @_;
+		my (@index_ordered_ids)	= unpack('Q>4', $key);
+		my @ids;
+		foreach my $pos (@$order) {
+			$ids[$pos] = shift(@index_ordered_ids);
+		}
+		foreach my $k (keys %$bound) {
+			my $id	= $bound->{$k};
+			unless ($id == $ids[$k]) {
+				return;
+			}
+		}
+		push(@quadids, \@ids);
+	});
+	
+	my $sub	= sub {
+		my $txn		= $self->env->BeginTxn(MDB_RDONLY);
+		my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
+		QUAD: while (my $tids = shift(@quadids)) {
+			my @terms;
+			foreach my $tid (@$tids) {
+				my $key	= pack('Q>', $tid);
+				my $termdata = $i2t->get($key);
+				next QUAD unless ($termdata);
+				my $term	= $self->_parse_term($termdata);
+				next QUAD unless ($term);
+				push(@terms, $term);
+			}
+			if (scalar(@terms) == 4) {
+				return Attean::Quad->new(@terms);
+			}
+		}
+		return;
+	};
+	return Attean::CodeIterator->new( generator => $sub, item_type => 'Attean::API::Quad' );
+}
+
 sub _get_quads {
 	my $self	= shift;
 	my @nodes	= @_;
@@ -166,7 +375,7 @@ sub _get_quads {
 				$bound++;
 				my $id			= $self->_get_term_id($n, $t2i);
 				unless ($id) {
-					warn "No such term in quadstore: " . $n->as_string;
+# 					warn "No such term in quadstore: " . $n->as_string;
 					return Attean::ListIterator->new( values => [], item_type => 'Attean::API::Quad' );
 				}
 				$bound{ $pos }	= $id;
@@ -177,83 +386,43 @@ sub _get_quads {
 	my $txn		= $self->env->BeginTxn(MDB_RDONLY);
 	my $quads	= $txn->OpenDB({ dbname => 'quads', });
 	if ($bound == 0) {
-		my $cursor	= $quads->Cursor;
-		my ($key, $value);
-		my @quadids;
-		eval {
-			local($LMDB_File::die_on_err)	= 0;
-			unless ($cursor->get($key, $value, MDB_FIRST)) {
-				while (1) {
-					my (@ids)	= unpack('Q>4', $value);
-					push(@quadids, \@ids);
-					last if $cursor->get($key, $value, MDB_NEXT);
-				}
-			}
-		};
-		
-		my $sub	= sub {
-			my $txn		= $self->env->BeginTxn(MDB_RDONLY);
-			my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
-			QUAD: while (my $tids = shift(@quadids)) {
-				my @terms;
-				foreach my $tid (@$tids) {
-					my $key	= pack('Q>', $tid);
-					my $termdata = $i2t->get($key);
-					next QUAD unless ($termdata);
-					my $term	= $self->_parse_term($termdata);
-					next QUAD unless ($term);
-					push(@terms, $term);
-				}
-				if (scalar(@terms) == 4) {
-					return Attean::Quad->new(@terms);
-				}
-			}
-			return;
-		};
-		return Attean::CodeIterator->new( generator => $sub, item_type => 'Attean::API::Quad' );
+		return $self->_get_all_unordered_quads($quads);
 	} else {
-		my $cursor	= $quads->Cursor;
-		my ($key, $value);
-		my @quadids;
-		eval {
-			local($LMDB_File::die_on_err)	= 0;
-			unless ($cursor->get($key, $value, MDB_FIRST)) {
-				QUAD: while (1) {
-					my (@ids)	= unpack('Q>4', $value);
-					foreach my $k (keys %bound) {
-						my $id	= $bound{$k};
-						unless ($id == $ids[$k]) {
-							next QUAD;
-						}
-					}
-					push(@quadids, \@ids);
-				} continue {
-					last if $cursor->get($key, $value, MDB_NEXT);
-				}
-			}
-		};
-		
-		my $sub	= sub {
-			my $txn		= $self->env->BeginTxn(MDB_RDONLY);
-			my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
-			QUAD: while (my $tids = shift(@quadids)) {
-				my @terms;
-				foreach my $tid (@$tids) {
-					my $key	= pack('Q>', $tid);
-					my $termdata = $i2t->get($key);
-					next QUAD unless ($termdata);
-					my $term	= $self->_parse_term($termdata);
-					next QUAD unless ($term);
-					push(@terms, $term);
-				}
-				if (scalar(@terms) == 4) {
-					return Attean::Quad->new(@terms);
-				}
-			}
-			return;
-		};
-		return Attean::CodeIterator->new( generator => $sub, item_type => 'Attean::API::Quad' );
+		if (my $best = $self->_best_index(\%bound, $txn)) {
+			my ($index, $score)	= @$best;
+			my $order		= $self->indexes->{$index};
+			warn "best index: $index";
+			my @positions	= @$order[0..$score-1];
+			my @prefix		= map { $bound{$_} } @positions;
+			my @lower		= @prefix;
+			my @upper		= @prefix;
+			$upper[-1]++;
+			return $self->_get_ordered_matching_quads($txn, \%bound, $index, \@lower, \@upper);
+		}
+		return $self->_get_unordered_matching_quads($quads, \%bound);
 	}
+}
+
+sub _best_index {
+	my $self	= shift;
+	my $bound	= shift;
+	my $txn		= shift;
+	my @scores;
+	while (my ($name, $order) = each %{ $self->indexes }) {
+		my $score	= 0;
+		foreach my $pos (@$order) {
+			if (exists $bound->{$pos}) {
+				$score++;
+			} else {
+				last
+			}
+		}
+		push(@scores, [$name, $score]);
+	}
+     
+	@scores	= sort { $b->[1] <=> $a->[1] } @scores;
+	warn Dumper(\@scores);
+	return shift(@scores);
 }
 
 =item C<< get_graphs >>
@@ -268,19 +437,13 @@ sub get_graphs {
 	my $txn		= $self->env->BeginTxn(MDB_RDONLY);
 	my $graphs	= $txn->OpenDB({ dbname => 'graphs', });
 	my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
-	my $cursor	= $graphs->Cursor;
 	my ($key, $value);
 	my @graph_ids;
-	eval {
-		local($LMDB_File::die_on_err)	= 0;
-		unless ($cursor->get($key, $value, MDB_FIRST)) {
-			while (1) {
-				my ($gid)	= unpack('Q>', $key);
-				push(@graph_ids, $gid);
-				last if $cursor->get($key, $value, MDB_NEXT);
-			}
-		}
-	};
+	$self->iterate_database($graphs, sub {
+		my ($key, $value)	= @_;
+		my ($gid)	= unpack('Q>', $key);
+		push(@graph_ids, $gid);
+	});
 	
 	my $sub	= sub {
 		my $txn		= $self->env->BeginTxn(MDB_RDONLY);
@@ -297,6 +460,167 @@ sub get_graphs {
 	};
 	return Attean::CodeIterator->new( generator => $sub, item_type => 'Attean::API::Term' );
 }
+
+sub _exists {
+	my $self	= shift;
+	my $qp		= shift;
+	
+	my $exists	= $self->get_quads($qp->values);
+	if (my $q = $exists->next) {
+		return 1;
+	}
+	return 0;
+}
+
+=item C<< add_quad ( $quad ) >>
+
+Adds the specified C<$quad> to the underlying model.
+
+=cut
+	
+	sub add_quad {
+		my $self	= shift;
+		my $st		= shift;
+		
+		if ($self->_exists($st)) {
+			return;
+		}
+		
+		my $txn		= $self->env->BeginTxn();
+		my $quads	= $txn->OpenDB({ dbname => 'quads', });
+		my $stats		= $txn->OpenDB({ dbname => 'stats', });
+		my $t2i		= $txn->OpenDB({ dbname => 'term_to_id', });
+		my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
+
+		my @ids		= map { $self->_get_or_create_term_id($_, $txn, $stats, $t2i, $i2t) } $st->values;
+		if (any { not defined($_) } @ids) {
+			return;
+		}
+
+		my $next_quad	= 'next_unassigned_quad_id';
+		my ($next)		= unpack('Q>', $stats->get($next_quad));
+# 		warn "next quad id: $next\n";
+		my $qid_value	= $next++;
+
+		my $qid			= pack('Q>', $qid_value);
+		my $qids		= pack('Q>4', @ids);
+		$quads->put($qid, $qids);
+		$self->_add_quad_to_indexes($qid, \@ids, $txn);
+		$stats->put($next_quad, pack('Q>', $next));
+		$txn->commit();
+	}
+	
+	sub _add_quad_to_indexes {
+		my $self	= shift;
+		my $qid		= shift;
+		my $ids		= shift;
+		my @ids		= @$ids;
+		my $txn		= shift;
+		while (my ($name, $order) = each %{ $self->indexes }) {
+			my $index	= $txn->OpenDB({ dbname => $name });
+			my @index_ordered_ids	= @ids[@$order];
+			my $qids		= pack('Q>4', @index_ordered_ids);
+			$index->put($qids, $qid);
+		}
+	}
+	
+	sub _remove_quad_to_indexes {
+		my $self	= shift;
+		my $qid		= shift;
+		my $ids		= shift;
+		my @ids		= @$ids;
+		my $txn		= shift;
+		while (my ($name, $order) = each %{ $self->indexes }) {
+			my $index	= $txn->OpenDB({ dbname => $name });
+			my @index_ordered_ids	= @ids[@$order];
+			my $qids		= pack('Q>4', @index_ordered_ids);
+			$index->del($qids);
+		}
+	}
+
+=item C<< remove_quad ( $statement ) >>
+
+Removes the specified C<$statement> from the underlying model.
+
+=cut
+
+	sub remove_quad {
+		my $self	= shift;
+		my $st		= shift;
+		my $txn		= $self->env->BeginTxn();
+		my $t2i		= $txn->OpenDB({ dbname => 'term_to_id', });
+		my $quads	= $txn->OpenDB({ dbname => 'quads', });
+
+		my @remove_ids		= map { $self->_get_term_id($_, $t2i) } $st->values;
+		unless (scalar(@remove_ids) == 4) {
+			return;
+		}
+		unless (all { defined($_) } @remove_ids) {
+			return;
+		}
+
+		my $cursor	= $quads->Cursor;
+		my ($key, $value);
+		eval {
+			local($LMDB_File::die_on_err)	= 0;
+			unless ($cursor->get($key, $value, MDB_FIRST)) {
+				QUAD: while (1) {
+					my $qid		= unpack('Q>', $key);
+					my (@ids)	= unpack('Q>4', $value);
+					if ($ids[0] == $remove_ids[0] and $ids[1] == $remove_ids[1] and $ids[2] == $remove_ids[2] and $ids[3] == $remove_ids[3]) {
+						warn "removing quad...";
+						$self->_remove_quad_to_indexes($qid, \@ids, $txn);
+						$cursor->del();
+						$txn->commit();
+						return;
+					}
+				} continue {
+					last if $cursor->get($key, $value, MDB_NEXT);
+				}
+			}
+		};
+	}
+
+=item C<< create_graph( $graph ) >>
+
+This is a no-op function for the memory quad-store.
+
+=cut
+
+	sub create_graph {
+		# no-op on a quad-store
+	}
+
+=item C<< drop_graph( $graph ) >>
+
+Removes all quads with the given C<< $graph >>.
+
+=cut
+
+	sub drop_graph {
+		my $self	= shift;
+		return $self->clear_graph(@_);
+	}
+
+=item C<< clear_graph( $graph ) >>
+
+Removes all quads with the given C<< $graph >>.
+
+=cut
+
+	sub clear_graph {
+		my $self	= shift;
+		my $graph	= shift;
+		my $txn		= $self->env->BeginTxn(MDB_RDONLY);
+		my $t2i		= $txn->OpenDB({ dbname => 'term_to_id', });
+
+		my $gid		= $self->_get_term_id($graph, $t2i);
+		return unless defined($gid);
+		
+		die 'unimplemented';
+	}
+
+
 }
 
 1;
