@@ -170,14 +170,14 @@ sub _encode_term {
 	if ($term->isa('Attean::IRI')) {
 		return encode_utf8('I"' . $value);
 	} elsif ($term->isa('Attean::Literal')) {
-		if (my $dt = $term->datatype) {
+		if (my $lang = $term->language) {
+				return encode_utf8('L' . $lang . '"' . $value);
+		} elsif (my $dt = $term->datatype) {
 			if ($dt->value eq 'http://www.w3.org/2001/XMLSchema#string') {
 				return encode_utf8('S"' . $value);
 			} else {
 				return encode_utf8('D' . $dt->value . '"' . $value);
 			}
-		} elsif (my $lang = $term->language) {
-				return encode_utf8('L' . $lang . '"' . $value);
 		} else {
 			return encode_utf8('S"' . $value);
 		}
@@ -196,6 +196,11 @@ sub _parse_term {
 	} elsif ($type eq 'S') {
 		my $value	= substr($data, 2);
 		return Attean::Literal->new(value => $value);
+	} elsif ($type eq 'L') {
+		my $i		= index($data, '"');
+		my $lang	= substr($data, 1, $i-1);
+		my $value	= substr($data, $i+1);
+		return Attean::Literal->new(value => $value, language => $lang);
 	} elsif ($type eq 'D') {
 		my $i		= index($data, '"');
 		my $dt		= substr($data, 1, $i-1);
