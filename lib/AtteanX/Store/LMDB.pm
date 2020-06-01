@@ -488,8 +488,7 @@ Adds the specified C<$quad> to the underlying model.
 		}
 		
 		my $txn		= $self->env->BeginTxn();
-		my $quads	= $txn->OpenDB({ dbname => 'quads', });
-		my $stats		= $txn->OpenDB({ dbname => 'stats', });
+		my $stats	= $txn->OpenDB({ dbname => 'stats', });
 		my $t2i		= $txn->OpenDB({ dbname => 'term_to_id', });
 		my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
 
@@ -505,9 +504,12 @@ Adds the specified C<$quad> to the underlying model.
 
 		my $qid			= pack('Q>', $qid_value);
 		my $qids		= pack('Q>4', @ids);
-		$quads->put($qid, $qids);
+
+		my $quads_dbi	= $txn->open('quads');
+		my $stats_dbi	= $txn->open('stats');
+		$txn->put($quads_dbi, $qid, $qids);
 		$self->_add_quad_to_indexes($qid, \@ids, $txn);
-		$stats->put($next_quad, pack('Q>', $next));
+		$txn->put($stats_dbi, $next_quad, pack('Q>', $next));
 		$txn->commit();
 	}
 	
@@ -518,10 +520,10 @@ Adds the specified C<$quad> to the underlying model.
 		my @ids		= @$ids;
 		my $txn		= shift;
 		while (my ($name, $order) = each %{ $self->indexes }) {
-			my $index	= $txn->OpenDB({ dbname => $name });
+			my $index	= $txn->open($name);
 			my @index_ordered_ids	= @ids[@$order];
-			my $qids		= pack('Q>4', @index_ordered_ids);
-			$index->put($qids, $qid);
+			my $qids	= pack('Q>4', @index_ordered_ids);
+			$txn->put($index, $qids, $qid);
 		}
 	}
 	
