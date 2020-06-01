@@ -22,13 +22,16 @@ use warnings;
 package AtteanX::Store::LMDB 0.001 {
 use Moo;
 use Type::Tiny::Role;
-use Types::Standard qw(Str InstanceOf HashRef);
+use Types::Standard qw(Bool Str InstanceOf HashRef);
 use LMDB_File qw(:flags :cursor_op);
 use Digest::SHA qw(sha256 sha256_hex);
 use Scalar::Util qw(refaddr reftype blessed);
 use Math::Cartesian::Product;
 use List::Util qw(any all first);
+use File::Path qw(make_path);
+use DateTime::Format::W3CDTF;
 use Devel::Peek;
+use Encode qw(encode_utf8);
 use namespace::clean;
 
 with 'Attean::API::QuadStore';
@@ -47,6 +50,7 @@ Returns a new LMDB-backed store object.
 
 =cut
 
+has initialize => (is => 'ro', isa => Bool, default => 0);
 has filename => (is => 'ro', isa => Str, required => 1);
 has env		=> (is => 'rw', isa => InstanceOf['LMDB::Env']);
 has indexes	=> (is => 'rw', isa => HashRef, default => sub { +{} });
@@ -55,12 +59,31 @@ sub BUILD {
 	my $self	= shift;
 	my $file	= $self->filename;
 	
+	unless (-d $file) {
+		make_path($file);
+	}
 	my $env = LMDB::Env->new($file, {
 		mapsize => 100 * 1024 * 1024 * 1024, # Plenty space, don't worry
 		maxdbs => 20, # Some databases
 		mode   => 0640,
 	});
 	$self->env($env);
+	if ($self->initialize) {
+		my $txn		= $self->env->BeginTxn();
+		my %databases;
+		foreach my $name (qw(quads stats fullIndexes term_to_id id_to_term graphs)) {
+			$databases{$name}	= $txn->OpenDB({ dbname => $name, flags => MDB_CREATE });
+		}
+		
+		my $f		= DateTime::Format::W3CDTF->new();
+		my $stats	= $databases{'stats'};
+		$stats->put("Diomede-Version", '0.0.13');
+		$stats->put("Last-Modified", $f->format_datetime(DateTime->now()));
+		foreach my $key (qw(next_unassigned_term_id next_unassigned_quad_id)) {
+			$stats->put($key, pack('Q>', 1));
+		}
+		$txn->commit();
+	}
 	
 	my $txn		= $self->env->BeginTxn(MDB_RDONLY);
 	my $indexes	= $txn->OpenDB({ dbname => 'fullIndexes' });
@@ -145,21 +168,21 @@ sub _encode_term {
 	my $term	= shift;
 	my $value	= $term->value;
 	if ($term->isa('Attean::IRI')) {
-		return 'I"' . $value;
+		return encode_utf8('I"' . $value);
 	} elsif ($term->isa('Attean::Literal')) {
 		if (my $dt = $term->datatype) {
 			if ($dt->value eq 'http://www.w3.org/2001/XMLSchema#string') {
-				return 'S"' . $value;
+				return encode_utf8('S"' . $value);
 			} else {
-				return 'D' . $dt->value . '"' . $value;
+				return encode_utf8('D' . $dt->value . '"' . $value);
 			}
 		} elsif (my $lang = $term->language) {
-				return 'L' . $lang . '"' . $value;
+				return encode_utf8('L' . $lang . '"' . $value);
 		} else {
-			return 'S"' . $value;
+			return encode_utf8('S"' . $value);
 		}
 	} elsif ($term->isa('Attean::Blank')) {
-		return 'B"' . $value;
+		return encode_utf8('B"' . $value);
 	}
 }
 
@@ -186,7 +209,7 @@ sub _parse_term {
 		return Attean::Blank->new($value);
 	} else {
 		Dump($data);
-		die;
+		die "Unrecognized encoded term value";
 	}
 	return;
 }
@@ -338,7 +361,7 @@ sub _compute_bound {
 			my $id			= $self->_get_term_id($n, $t2i);
 			unless ($id) {
 # 					warn "No such term in quadstore: " . $n->as_string;
-				return Attean::ListIterator->new( values => [], item_type => 'Attean::API::Quad' );
+				die "No such term in quadstore: " . $n->as_string;
 			}
 			$bound{ $pos }	= $id;
 		}
@@ -349,7 +372,10 @@ sub _compute_bound {
 sub _get_quads {
 	my $self	= shift;
 	my @nodes	= @_;
-	my %bound	= $self->_compute_bound(@nodes);
+	my %bound	= eval { $self->_compute_bound(@nodes) };
+	if ($@) {
+		return Attean::ListIterator->new( values => [], item_type => 'Attean::API::Quad' );
+	}
 	my $bound	= scalar(@{[keys %bound]});
 	
 	my $txn		= $self->env->BeginTxn(MDB_RDONLY);
@@ -581,12 +607,11 @@ Removes all quads with the given C<< $graph >>.
 	sub clear_graph {
 		my $self	= shift;
 		my $graph	= shift;
-		my %bound	= $self->_compute_bound(undef, undef, undef, $graph);
-		my $bound	= scalar(@{[keys %bound]});
-		die 'unimplemented';
+		my $quads	= $self->get_quads(undef, undef, undef, $graph);
+		while (my $q = $quads->next) {
+			$self->remove_quad($q);
+		}
 	}
-
-
 }
 
 1;

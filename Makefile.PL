@@ -23,6 +23,7 @@ requires		'namespace::clean'			=> 0;
 requires		'Try::Tiny'					=> 0;
 requires		'Type::Tiny'				=> 0;
 requires		'LMDB_File'					=> 0;
+requires		'DateTime::Format::W3CDTF'	=> 0;
 
 resources(
 	'homepage'   => "http://search.cpan.org/dist/Attean/",
