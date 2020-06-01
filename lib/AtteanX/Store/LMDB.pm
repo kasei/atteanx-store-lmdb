@@ -569,7 +569,6 @@ Removes the specified C<$statement> from the underlying model.
 					my $qid		= unpack('Q>', $key);
 					my (@ids)	= unpack('Q>4', $value);
 					if ($ids[0] == $remove_ids[0] and $ids[1] == $remove_ids[1] and $ids[2] == $remove_ids[2] and $ids[3] == $remove_ids[3]) {
-						warn "removing quad...";
 						$self->_remove_quad_to_indexes($qid, \@ids, $txn);
 						$cursor->del();
 						$txn->commit();
