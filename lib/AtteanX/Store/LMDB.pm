@@ -71,7 +71,7 @@ sub BUILD {
 	if ($self->initialize) {
 		my $txn		= $self->env->BeginTxn();
 		my %databases;
-		foreach my $name (qw(quads stats fullIndexes term_to_id id_to_term graphs)) {
+		foreach my $name (qw(quads stats fullIndexes term_to_id id_to_term graphs prefixes)) {
 			$databases{$name}	= $txn->OpenDB({ dbname => $name, flags => MDB_CREATE });
 		}
 		
