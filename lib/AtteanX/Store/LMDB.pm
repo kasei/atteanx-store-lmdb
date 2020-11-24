@@ -82,6 +82,14 @@ sub BUILD {
 		foreach my $key (qw(next_unassigned_term_id next_unassigned_quad_id)) {
 			$stats->put($key, pack('Q>', 1));
 		}
+		my $indexes	= $databases{'fullIndexes'};
+		my %positions = ('s' => 0, 'p' => 1, 'o' => 2, 'g' => 3);
+		foreach my $key (qw(spog pogs gops)) {
+			my @pos	= map { $positions{$_} } split(//, $key);
+			$txn->OpenDB({ dbname => $key, flags => MDB_CREATE });
+			$indexes->put($key, pack('Q>4', @pos));
+		}
+		
 		$txn->commit();
 	}
 	
