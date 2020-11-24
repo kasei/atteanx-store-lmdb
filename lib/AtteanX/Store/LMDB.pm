@@ -374,21 +374,23 @@ sub _compute_bound {
 			my $id			= $self->_get_term_id($n, $t2i);
 			unless ($id) {
 # 					warn "No such term in quadstore: " . $n->as_string;
-				die "No such term in quadstore: " . $n->as_string;
+# 				die "No such term in quadstore: " . $n->as_string; # this spends a lot of time in Carp::Always
+				return;
 			}
 			$bound{ $pos }	= $id;
 		}
 	}
-	return %bound;
+	return \%bound;
 }
 
 sub _get_quads {
 	my $self	= shift;
 	my @nodes	= @_;
-	my %bound	= eval { $self->_compute_bound(@nodes) };
-	if ($@) {
+	my $bound_data	= $self->_compute_bound(@nodes);
+	unless ($bound_data) {
 		return Attean::ListIterator->new( values => [], item_type => 'Attean::API::Quad' );
 	}
+	my %bound	= %$bound_data;
 	my $bound	= scalar(@{[keys %bound]});
 	
 	my $txn		= $self->env->BeginTxn(MDB_RDONLY);
