@@ -7,16 +7,17 @@ inc/Module/Install/DOAPChangeSets.pm
 inc/Module/Install/Fetch.pm
 inc/Module/Install/Metadata.pm
 inc/Module/Install/Scripts.pm
-inc/Module/Install/Share.pm
 inc/Module/Install/Win32.pm
 inc/Module/Install/WriteAll.pm
 lib/AtteanX/Store/LMDB.pm
 LICENSE
 MANIFEST			This list of files
-MANIFEST.bak
 META.yml
 meta/changes.ttl
 README.md
+t/add_iter.t
+t/create_read_delete.t
+t/graph_mgmt.t
 t/simple.t
 xt/pod-coverage.t
 xt/pod.t
