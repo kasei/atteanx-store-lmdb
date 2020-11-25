@@ -31,7 +31,7 @@ use List::Util qw(any all first);
 use File::Path qw(make_path);
 use DateTime::Format::W3CDTF;
 use Devel::Peek;
-use Encode qw(encode_utf8);
+use Encode qw(encode_utf8 decode_utf8);
 use namespace::clean;
 
 with 'Attean::API::QuadStore';
@@ -165,10 +165,19 @@ predicate, object, and graph. Any of the arguments may be undef to match any val
 
 sub get_quads {
 	my $self	= shift;
-	my @nodes	= map { ref($_) eq 'ARRAY' ? $_ : [$_] } @_;
-	my @iters;
-	cartesian { push(@iters, $self->_get_quads(@_)) } @nodes;
-	return Attean::IteratorSequence->new( iterators => \@iters, item_type => 'Attean::API::Quad' );
+	my $needs_cartesian	= any { ref($_) eq 'ARRAY' } @_;
+	if ($needs_cartesian) {
+		my @nodes	= map { ref($_) eq 'ARRAY' ? $_ : [$_] } @_;
+		my @iters;
+		cartesian { push(@iters, $self->_get_quads(@_)) } @nodes;
+		if (scalar(@iters) == 1) {
+			return shift(@iters);
+		} else {
+			return Attean::IteratorSequence->new( iterators => \@iters, item_type => 'Attean::API::Quad' );
+		}
+	} else {
+		return $self->_get_quads(@_);
+	}
 }
 
 sub _encode_term {
@@ -196,7 +205,7 @@ sub _encode_term {
 
 sub _parse_term {
 	my $self	= shift;
-	my $data	= shift;
+	my $data	= decode_utf8(shift);
 	my $type	= substr($data, 0, 1);
 	if ($type eq 'I') {
 		my $value	= substr($data, 2);
@@ -359,25 +368,26 @@ sub _get_ordered_matching_quads {
 sub _compute_bound {
 	my $self	= shift;
 	my @nodes	= @_;
+	my $txn		= $nodes[4] // $self->env->BeginTxn(MDB_RDONLY);;
 	my $bound	= 0;
 	my %bound;
-	my $txn		= $self->env->BeginTxn(MDB_RDONLY);
 	my $t2i		= $txn->OpenDB({ dbname => 'term_to_id', });
 	foreach my $pos (0 .. 3) {
 		my $n	= $nodes[ $pos ];
-		if (blessed($n) and $n->does('Attean::API::Variable')) {
-			$n	= undef;
-			$nodes[$pos]	= undef;
-		}
 		if (blessed($n)) {
-			$bound++;
-			my $id			= $self->_get_term_id($n, $t2i);
-			unless ($id) {
-# 					warn "No such term in quadstore: " . $n->as_string;
-# 				die "No such term in quadstore: " . $n->as_string; # this spends a lot of time in Carp::Always
-				return;
+			if ($n->does('Attean::API::Variable')) {
+				$n	= undef;
+				$nodes[$pos]	= undef;
+			} else {
+				$bound++;
+				my $id			= $self->_get_term_id($n, $t2i);
+				unless ($id) {
+	# 					warn "No such term in quadstore: " . $n->as_string;
+	# 				die "No such term in quadstore: " . $n->as_string; # this spends a lot of time in Carp::Always
+					return;
+				}
+				$bound{ $pos }	= $id;
 			}
-			$bound{ $pos }	= $id;
 		}
 	}
 	return \%bound;
@@ -388,6 +398,8 @@ sub _get_quads {
 	my @nodes	= @_;
 	my $bound_data	= $self->_compute_bound(@nodes);
 	unless ($bound_data) {
+		# one of the bound terms in the pattern doesn't exist in the database,
+		# so no quads will match.
 		return Attean::ListIterator->new( values => [], item_type => 'Attean::API::Quad' );
 	}
 	my %bound	= %$bound_data;
@@ -472,6 +484,18 @@ sub get_graphs {
 	return Attean::CodeIterator->new( generator => $sub, item_type => 'Attean::API::Term' );
 }
 
+sub _exists_with_txn {
+	my $self	= shift;
+	my $txn		= shift;
+	my $qp		= shift;
+	
+	my $exists	= $self->_get_quads($qp->values);
+	if (my $q = $exists->next) {
+		return 1;
+	}
+	return 0;
+}
+
 sub _exists {
 	my $self	= shift;
 	my $qp		= shift;
@@ -501,6 +525,58 @@ Adds the specified C<$quad> to the underlying model.
 		my $stats	= $txn->OpenDB({ dbname => 'stats', });
 		my $t2i		= $txn->OpenDB({ dbname => 'term_to_id', });
 		my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
+		my $graphs	= $txn->OpenDB({ dbname => 'graphs', });
+
+		my @ids		= map { $self->_get_or_create_term_id($_, $txn, $stats, $t2i, $i2t) } $st->values;
+		if (any { not defined($_) } @ids) {
+			return;
+		}
+
+		my $next_quad	= 'next_unassigned_quad_id';
+		my ($next)		= unpack('Q>', $stats->get($next_quad));
+# 		warn "next quad id: $next\n";
+		my $qid_value	= $next++;
+
+		my $qid			= pack('Q>', $qid_value);
+		my $qids		= pack('Q>4', @ids);
+		my $gid			= pack('Q>', $ids[3]);
+
+		my $graphs_dbi	= $txn->open('graphs');
+		my $quads_dbi	= $txn->open('quads');
+		my $stats_dbi	= $txn->open('stats');
+		$txn->put($quads_dbi, $qid, $qids);
+
+		my $graphs_cursor = $graphs->Cursor;
+		my $key	= $gid;
+		my $empty	= '';
+		eval {
+			local($LMDB_File::die_on_err)	= 0;
+			if (my $err = $graphs_cursor->get($key, $empty, MDB_SET_RANGE)) {
+				$graphs_cursor->put($gid, $empty);
+			} else {
+				if ($key ne $gid) {
+					$graphs_cursor->put($gid, $empty);
+				}
+			}
+		};
+
+		$self->_add_quad_to_indexes($qid, \@ids, $txn);
+		$txn->put($stats_dbi, $next_quad, pack('Q>', $next));
+		$txn->commit();
+	}
+	
+	sub add_quad_with_txn {
+		my $self	= shift;
+		my $txn		= shift;
+		my $st		= shift;
+		
+		if ($self->_exists_with_txn($txn, $st)) {
+			return;
+		}
+		
+		my $stats	= $txn->OpenDB({ dbname => 'stats', });
+		my $t2i		= $txn->OpenDB({ dbname => 'term_to_id', });
+		my $i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
 
 		my @ids		= map { $self->_get_or_create_term_id($_, $txn, $stats, $t2i, $i2t) } $st->values;
 		if (any { not defined($_) } @ids) {
@@ -520,7 +596,6 @@ Adds the specified C<$quad> to the underlying model.
 		$txn->put($quads_dbi, $qid, $qids);
 		$self->_add_quad_to_indexes($qid, \@ids, $txn);
 		$txn->put($stats_dbi, $next_quad, pack('Q>', $next));
-		$txn->commit();
 	}
 	
 	sub _add_quad_to_indexes {
@@ -563,6 +638,7 @@ Removes the specified C<$statement> from the underlying model.
 		my $txn		= $self->env->BeginTxn();
 		my $t2i		= $txn->OpenDB({ dbname => 'term_to_id', });
 		my $quads	= $txn->OpenDB({ dbname => 'quads', });
+		my $graphs	= $txn->OpenDB({ dbname => 'graphs', });
 
 		my @remove_ids		= map { $self->_get_term_id($_, $t2i) } $st->values;
 		unless (scalar(@remove_ids) == 4) {
@@ -581,8 +657,23 @@ Removes the specified C<$statement> from the underlying model.
 					my $qid		= unpack('Q>', $key);
 					my (@ids)	= unpack('Q>4', $value);
 					if ($ids[0] == $remove_ids[0] and $ids[1] == $remove_ids[1] and $ids[2] == $remove_ids[2] and $ids[3] == $remove_ids[3]) {
+						my $g		= $ids[3];
 						$self->_remove_quad_to_indexes($qid, \@ids, $txn);
 						$cursor->del();
+						
+						unless ($self->_graph_id_exists_with_txn($txn, $quads, $t2i, $g)) {
+							# no more quads with this graph, so delete it from the graphs table
+							my $graphs_cursor = $graphs->Cursor;
+							my $gid = pack('Q>', $g);
+							my $key	= $gid;
+							my $empty	= '';
+							unless ($graphs_cursor->get($key, $empty, MDB_SET_RANGE)) {
+								if ($gid eq $key) {
+									$graphs_cursor->del();
+								}
+							}
+						}
+
 						$txn->commit();
 						return;
 					}
@@ -627,6 +718,130 @@ Removes all quads with the given C<< $graph >>.
 		while (my $q = $quads->next) {
 			$self->remove_quad($q);
 		}
+	}
+
+	sub add_iter {
+		my $BULK_LOAD	= 1;
+
+		my $self	= shift;
+		my $iter	= shift;
+		my $type	= $iter->item_type;
+		die "Iterator type $type isn't quads" unless (Role::Tiny::does_role($type, 'Attean::API::Quad'));
+
+		my ($txn, $stats, $t2i, $i2t, $quads_dbi, $stats_dbi, $graphs_dbi);
+		if ($BULK_LOAD) {
+			$txn		= $self->env->BeginTxn();
+			$stats	= $txn->OpenDB({ dbname => 'stats', });
+			$t2i		= $txn->OpenDB({ dbname => 'term_to_id', });
+			$i2t		= $txn->OpenDB({ dbname => 'id_to_term', });
+			$graphs_dbi	= $txn->OpenDB({ dbname => 'graphs', });
+			$quads_dbi	= $txn->open('quads');
+			$stats_dbi	= $txn->open('stats');
+		}
+
+		my $next_quad	= 'next_unassigned_quad_id';
+		my ($next)		= unpack('Q>', $stats->get($next_quad));
+		my %graphs;
+		while (my $q = $iter->next) {
+			if ($BULK_LOAD) {
+				if ($self->_quad_exists_with_txn($txn, $quads_dbi, $t2i, $q->values)) {
+					next;
+				}
+		
+				my @ids		= map { $self->_get_or_create_term_id($_, $txn, $stats, $t2i, $i2t) } $q->values;
+				if (any { not defined($_) } @ids) {
+					return;
+				}
+
+		# 		warn "next quad id: $next\n";
+				my $qid_value	= $next++;
+
+				my $qid			= pack('Q>', $qid_value);
+				my $qids		= pack('Q>4', @ids);
+				my $g			= $ids[3];
+				$graphs{$g}		= pack('Q>', $g);
+
+				$txn->put($quads_dbi, $qid, $qids);
+				$self->_add_quad_to_indexes($qid, \@ids, $txn);
+			} else {
+				$self->add_quad($q);
+			}
+		}
+		if ($BULK_LOAD) {
+			my $empty	= '';
+			my $graphs_cursor = $graphs_dbi->Cursor;
+			foreach my $gid (values %graphs) {
+				my $key	= $gid;
+				eval {
+					local($LMDB_File::die_on_err)	= 0;
+					if (my $err = $graphs_cursor->get($key, $empty, MDB_SET_RANGE)) {
+						$graphs_cursor->put($gid, $empty);
+					} else {
+						if ($key ne $gid) {
+							$graphs_cursor->put($gid, $empty);
+						}
+					}
+				};
+			}
+			$txn->put($stats_dbi, $next_quad, pack('Q>', $next));
+			$txn->commit();
+		}
+	}
+
+	sub _quad_exists_with_txn {
+		my $self	= shift;
+		my $txn		= shift;
+		my $quads	= shift;
+		my $t2i		= shift;
+		my @nodes	= @_;
+# 		my $bound_data	= $self->_compute_bound(@nodes, $txn);
+		my %bound;
+		foreach my $pos (0 .. 3) {
+			my $n	= $nodes[ $pos ];
+			my $id	= $self->_get_term_id($n, $t2i);
+			unless ($id) {
+				# one of the bound terms in the pattern doesn't exist in the database,
+				# so no quads will match.
+				return 0;
+			}
+			$bound{ $pos }	= $id;
+		}
+		if (my $best = $self->_best_index(\%bound, $txn)) {
+			my ($index, $score)	= @$best;
+			my $order		= $self->indexes->{$index};
+			my @positions	= @$order[0..$score-1];
+			my @prefix		= map { $bound{$_} } @positions;
+			my @lower		= @prefix;
+			my @upper		= @prefix;
+			$upper[-1]++;
+			my $quadids	= $self->_get_ordered_matching_quads($txn, \%bound, $index, \@lower, \@upper);
+			return scalar(@$quadids);
+		}
+		my $quadids	= $self->_get_unordered_matching_quads($quads, \%bound);
+		return scalar(@$quadids);
+	}
+
+
+	sub _graph_id_exists_with_txn {
+		my $self	= shift;
+		my $txn		= shift;
+		my $quads	= shift;
+		my $t2i		= shift;
+		my $gid		= shift;
+		my %bound	= (3 => $gid);
+		if (my $best = $self->_best_index(\%bound, $txn)) {
+			my ($index, $score)	= @$best;
+			my $order		= $self->indexes->{$index};
+			my @positions	= @$order[0..$score-1];
+			my @prefix		= map { $bound{$_} } @positions;
+			my @lower		= @prefix;
+			my @upper		= @prefix;
+			$upper[-1]++;
+			my $quadids	= $self->_get_ordered_matching_quads($txn, \%bound, $index, \@lower, \@upper);
+			return scalar(@$quadids);
+		}
+		my $quadids	= $self->_get_unordered_matching_quads($quads, \%bound);
+		return scalar(@$quadids);
 	}
 }
 
