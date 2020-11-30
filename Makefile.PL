@@ -1,6 +1,7 @@
 use strict;
 use warnings;
 
+use lib '.';
 use inc::Module::Install;
 
 name			'AtteanX-Store-LMDB';
@@ -33,8 +34,6 @@ resources(
 );
 
 author_tests('xt');
-
-install_script glob('bin/attean_*');
 
 write_doap_changes "meta/changes.ttl", "Changes", "turtle";
 
