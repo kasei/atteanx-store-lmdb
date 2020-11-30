@@ -26,8 +26,8 @@ requires		'LMDB_File'					=> 0;
 requires		'DateTime::Format::W3CDTF'	=> 0;
 
 resources(
-	'homepage'   => "http://search.cpan.org/dist/Attean/",
-	'repository' => "http://github.com/kasei/atteanx-store-lmdb/",
+	'homepage'   => "https://metacpan.org/release/Attean",
+	'repository' => "https://github.com/kasei/atteanx-store-lmdb/",
 	'bugtracker' => "https://github.com/kasei/atteanx-store-lmdb/issues",
 	'IRC'        => "irc://irc.perl.org/#perlrdf",
 );
