@@ -22,7 +22,7 @@ my:project
 	:name					"AtteanX::Store::LMDB" ;
 	:shortdesc				"A LMDB-backed quadstore for Attean" ;
 	:programming-language	"Perl" ;
-	:created				"2016-02-27"^^xsd:date ;
+	:created				"2020-05-29"^^xsd:date ;
 	:maintainer				my:developer ;
 	:homepage				<http://search.cpan.org/dist/AtteanX::Store::LMDB/> ;
 	:bug-database			<https://github.com/kasei/atteanx-store-lmdb/issues> ;
@@ -33,7 +33,7 @@ my:project
 
 my:v_0-001
 	a					:Version ;
-	dc:issued			"2020-05-29"^^xsd:date ;
+	dc:issued			"2020-11-30"^^xsd:date ;
 	:revision			"0.001" ;
 	dcs:changeset [
 		dcs:item

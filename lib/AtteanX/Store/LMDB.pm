@@ -19,7 +19,8 @@ AtteanX::Store::LMDB provides a persistent quad-store based on LMDB.
 use v5.14;
 use warnings;
 
-package AtteanX::Store::LMDB 0.001 {
+package AtteanX::Store::LMDB {
+our $VERSION	= '0.001';
 use Moo;
 use Type::Tiny::Role;
 use Types::Standard qw(Bool Str InstanceOf HashRef);

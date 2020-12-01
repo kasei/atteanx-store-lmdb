@@ -3,6 +3,7 @@ cover_db
 .git
 .DS_Store
 .proverc
+bin
 cover.sh
 Makefile
 MANIFEST.SKIP
