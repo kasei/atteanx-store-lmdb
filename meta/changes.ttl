@@ -28,7 +28,18 @@ my:project
 	:bug-database			<https://github.com/kasei/atteanx-store-lmdb/issues> ;
 	doap:download-page		<http://search.cpan.org/dist/AtteanX-Store-LMDB/> ;
 	doap:download-mirror	<http://kasei.us/code/files/> ;
-	:release				my:v_0-001 ;
+	:release				my:v_0-001 , my:v_0-002 ;
+	.
+
+my:v_0-002
+	a					:Version ;
+	dc:issued			"2026-05-08"^^xsd:date ;
+	:revision			"0.002" ;
+	dcs:changeset [
+		dcs:item
+			[ a dcs:Update ; rdfs:label "Update Makefile.PL to use GNU tar on MacOS when creating new releases." ],
+			[ a dcs:Update ; rdfs:label "Remove use of Test::Modern in tests." ]
+	]
 	.
 
 my:v_0-001

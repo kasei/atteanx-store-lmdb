@@ -4,7 +4,7 @@ AtteanX::Store::LMDB - LMDB-based RDF store
 
 =head1 VERSION
 
-This document describes AtteanX::Store::LMDB version 0.001
+This document describes AtteanX::Store::LMDB version 0.002
 
 =head1 SYNOPSIS
 
@@ -20,7 +20,7 @@ use v5.14;
 use warnings;
 
 package AtteanX::Store::LMDB {
-our $VERSION	= '0.001';
+our $VERSION	= '0.002';
 use Moo;
 use Type::Tiny::Role;
 use Types::Standard qw(Bool Str InstanceOf HashRef);
